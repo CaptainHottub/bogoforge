@@ -11,7 +11,6 @@ static HSACO: &[u8] = include_bytes!(env!("KERNEL_HSACO_PATH"));
 
 type HipError = i32;
 const HIP_SUCCESS: HipError = 0;
-const HIP_MEMCPY_H2D: u32 = 1;
 const HIP_MEMCPY_D2H: u32 = 2;
 
 #[link(name = "amdhip64")]

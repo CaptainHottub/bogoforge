@@ -51,7 +51,7 @@ fn init_logging(config: &config::Config) -> anyhow::Result<()> {
         .format(move |out, message, record| {
             out.finish(format_args!(
                 "{} [{}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                Local::now().format("%Y-%m-%d %H:%M:%S.%f"),
                 record.level(),
                 message
             ))

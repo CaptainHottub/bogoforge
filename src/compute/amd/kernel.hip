@@ -33,13 +33,6 @@ __device__ __forceinline__ uint32_t xnext(uint32_t s[4]) {
     return result;
 }
 
-__device__ __forceinline__ uint32_t xint_c(uint32_t s[4], const uint32_t max) {
-    const uint32_t threshold = (uint32_t)(0x100000000ULL % (uint64_t)max);
-    uint32_t x;
-    do { x = xnext(s); } while (x < threshold);
-    return x % max;
-}
-
 __device__ __forceinline__ void warp_reduce(
     int *score, unsigned long long *index, uint32_t *lane_out
 ) {
@@ -79,25 +72,52 @@ void bogo_range_kernel(
     uint8_t  best_arr[25];
     uint64_t best_idx   = lo;
 
+    // 1-cycle stride addition (Replaces 64-bit multiplication inside loop)
+    const uint64_t magic_mult = 0x9e3779b97f4a7c15ULL;
+    const uint64_t z_stride   = stride * magic_mult;
+    uint64_t current_seed     = base_seed + (lo + tid) * magic_mult;
+
     for (uint64_t iter = lo + tid; iter < hi; iter += stride) {
         uint32_t s[4];
-        xseed(base_seed + iter * 0x9e3779b97f4a7c15ULL, s);
+        xseed(current_seed, s);
+        current_seed += z_stride; 
+
+        // PHASE 1: PURE ALU
+        // Compute all random indices before touching memory to avoid stalls.
+        // xint_c is directly embedded to violently force compile-time constant propagation.
+        uint32_t js[24];
+        #pragma unroll 24
+        for (int i = 24; i > 0; i--) {
+            const uint32_t max_val = i + 1;
+            const uint32_t threshold = (uint32_t)(0x100000000ULL % max_val);
+            uint32_t x;
+            do { x = xnext(s); } while (x < threshold);
+            js[i-1] = x % max_val; 
+        }
 
         #pragma unroll
         for (int p = 0; p < 25; p++) arr[p * 256] = (unsigned int)(p + 1);
 
+        // PHASE 2: MEMORY & SCORING
+        int c = 0;
+        
         #pragma unroll 24
         for (int i = 24; i > 0; i--) {
-            const uint32_t j = xint_c(s, (uint32_t)(i + 1));
+            const uint32_t j = js[i-1];
             const unsigned int tmp = arr[i * 256];
-            arr[i * 256] = arr[j * 256];
+            const unsigned int val = arr[j * 256]; // The value moving to position i
+            
+            arr[i * 256] = val;
             arr[j * 256] = tmp;
+            
+            // Branchless Tally: arr[i * 256] is now finalized. Score it instantly.
+            c += (val == (unsigned int)(i + 1));
         }
+        
+        // Element 0 is implicitly finalized by the end. Score it.
+        c += (arr[0] == 1);
 
-        int c = 0;
-        #pragma unroll
-        for (int p = 0; p < 25; p++) c += ((int)arr[p * 256] == p + 1);
-
+        // Final score check (Original 25-iteration scoring loop is entirely deleted)
         if (c > best_score) {
             best_score = c;
             best_idx   = iter;

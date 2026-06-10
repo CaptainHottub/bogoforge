@@ -137,7 +137,7 @@ impl ForgeRuntime {
                     _ => {
                         let _ = init_tx.send(Err(format!(
                             "gpu_profile \"{}\" requires a backend not compiled in \
-                             (rebuild with --features cuda or --features hip)",
+                             (rebuild with --features cuda or --features hip or --features vk)",
                             self.config.compute.gpu_profile
                         )));
                     }

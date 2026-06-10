@@ -56,11 +56,19 @@ fn spawn_sampler(metrics: SharedMetrics, cancel: CancellationToken) -> std::thre
         // The first CPU reading is meaningless until a second sample lands.
         std::thread::sleep(Duration::from_millis(300));
 
-        // If `nvidia-smi` isn't on PATH (or this isn't an NVIDIA box) there's
+        // Determine which GPU telemetry tool to use (1 = NVIDIA, 2 = AMD, 0 = None)
+        // If `nvidia-smi` or `rocm-smi` isn't on PATH there's
         // no point spawning a subprocess every second forever — probe once,
         // and only keep polling if it actually answered.
-        let mut gpu_available = sample_nvidia_smi().is_some();
-        if !gpu_available {
+        let mut active_gpu_tool = if sample_nvidia_smi().is_some() {
+            1
+        } else if sample_rocm_smi().is_some() {
+            2
+        } else {
+            0
+        };
+
+        if active_gpu_tool == 0 {
             metrics.clear_gpu_stats();
         }
 
@@ -73,16 +81,24 @@ fn spawn_sampler(metrics: SharedMetrics, cancel: CancellationToken) -> std::thre
             sys.refresh_memory();
             metrics.set_host_stats(sys.global_cpu_usage() as f64, sys.used_memory(), sys.total_memory());
 
-            if gpu_available {
-                match sample_nvidia_smi() {
-                    Some((name, util, used_mb, total_mb, temp)) => {
+            match active_gpu_tool {
+                1 => {
+                    if let Some((name, util, used_mb, total_mb, temp)) = sample_nvidia_smi() {
                         metrics.set_gpu_stats(name, util, used_mb, total_mb, temp);
-                    }
-                    None => {
-                        gpu_available = false;
+                    } else {
+                        active_gpu_tool = 0;
                         metrics.clear_gpu_stats();
                     }
                 }
+                2 => {
+                    if let Some((name, util, used_mb, total_mb, temp)) = sample_rocm_smi() {
+                        metrics.set_gpu_stats(name, util, used_mb, total_mb, temp);
+                    } else {
+                        active_gpu_tool = 0;
+                        metrics.clear_gpu_stats();
+                    }
+                }
+                _ => {}
             }
 
             // Sleep in short slices so cancellation lands within ~100ms
@@ -130,6 +146,82 @@ fn sample_nvidia_smi() -> Option<(String, i32, u64, u64, i32)> {
     let used_mb: u64 = parts.next()?.parse().ok()?;
     let total_mb: u64 = parts.next()?.parse().ok()?;
     let temp: i32 = parts.next()?.parse().ok()?;
+
+    Some((name, util, used_mb, total_mb, temp))
+}
+
+/// Runs `rocm-smi` once and parses the CSV telemetry.
+/// Maps the AMD output perfectly into the expected format:
+/// `name, utilization.gpu, memory.used (MB), memory.total (MB), temperature.gpu`.
+fn sample_rocm_smi() -> Option<(String, i32, u64, u64, i32)> {
+    let mut cmd = std::process::Command::new("rocm-smi");
+    cmd.args([
+        "--showproductname",
+        "--showuse",
+        "--showmeminfo", "vram",
+        "--showtemp",
+        "--csv",
+    ]);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+
+    // Parse headers to find column indices dynamically
+    let header_line = lines.next()?;
+    let headers: Vec<&str> = header_line.split(',').collect();
+
+    let mut idx_name = None;
+    let mut idx_util = None;
+    let mut idx_used = None;
+    let mut idx_total = None;
+    let mut idx_temp = None;
+
+    for (i, h) in headers.iter().enumerate() {
+        let h_lower = h.to_lowercase();
+        if h_lower.contains("card series") || h_lower.contains("product") {
+            idx_name = Some(i);
+        } else if h_lower.contains("use (%)") {
+            idx_util = Some(i);
+        } else if h_lower.contains("used memory") {
+            idx_used = Some(i);
+        } else if h_lower.contains("total memory") {
+            idx_total = Some(i);
+        } else if h_lower.contains("temp") && h_lower.contains("edge") {
+            idx_temp = Some(i);
+        }
+    }
+
+    let data_line = lines.next()?;
+    let parts: Vec<&str> = data_line.split(',').collect();
+
+    // Extract and clean the strings (stripping quotes and non-numeric chars)
+    let name = parts.get(idx_name?)?.replace('"', "").trim().to_string();
+
+    let util_str = parts.get(idx_util?)?.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let util: i32 = util_str.parse().ok()?;
+
+    // Convert AMD's Byte output into Megabytes to match NVIDIA
+    let used_bytes_str = parts.get(idx_used?)?.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let used_mb = used_bytes_str.parse::<u64>().ok()? / (1024 * 1024);
+
+    let total_bytes_str = parts.get(idx_total?)?.chars().filter(|c| c.is_ascii_digit()).collect::<String>();
+    let total_mb = total_bytes_str.parse::<u64>().ok()? / (1024 * 1024);
+
+    // AMD sometimes outputs floats for temp (e.g., 45.0), so we parse to f64 first
+    let temp_str = parts.get(idx_temp?)?.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect::<String>();
+    let temp: i32 = temp_str.parse::<f64>().ok()? as i32; 
 
     Some((name, util, used_mb, total_mb, temp))
 }
@@ -571,7 +663,7 @@ fn draw_stats(frame: &mut Frame, area: Rect, metrics: &SharedMetrics) {
     let (gpu_load_value, gpu_load_color) = match (&gpu_name, gpu_util) {
         (Some(_), u) if u >= 0 => (format!("{u}% util\n{gpu_temp}C"), load_color(u as f64)),
         (Some(_), _) => ("n/a".to_string(), DIM),
-        (None, _) => ("no telemetry\n(nvidia-smi not found)".to_string(), DIM),
+        (None, _) => ("no telemetry\n(nvidia-smi or rocm-smi not found)".to_string(), DIM),
     };
     let (gpu_mem_value, gpu_mem_color) = match &gpu_name {
         Some(_) if gpu_mem_total > 0 => {
