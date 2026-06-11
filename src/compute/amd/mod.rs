@@ -85,7 +85,7 @@ impl AmdBackend {
             let mut stream = ptr::null_mut::<()>();
             hip_check(hipStreamCreate(&mut stream))?;
 
-            let n = blocks as usize;
+            let n = (blocks as usize) * 256;
 
             let mut dev_best    = ptr::null_mut::<()>();
             let mut dev_arrays  = ptr::null_mut::<()>();

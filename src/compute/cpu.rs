@@ -24,6 +24,7 @@ const GOLDEN: u64 = 0x9e3779b97f4a7c15;
 // practice, likely register/cache pressure from doubling the live state and
 // the per-lane arrays. Reverted; one 16-wide stream per batch wins.)
 const LANES: usize = 16;
+// Zen 3 CPU's get better performance when LANES is set to 8
 
 type V = Simd<u32, LANES>;
 type M = Mask<i32, LANES>;

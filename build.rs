@@ -75,21 +75,39 @@ mod hip {
         }
 
         let arch = std::env::var("HIP_ARCH").unwrap_or_else(|_| "gfx1201".into());
-        // Override with HIP_ARCH=gfx1103, gfx1201, etc.
         println!("cargo:warning=compiling kernel.hip for --offload-arch={arch}");
 
-        let output = Command::new("hipcc")
-            .args([
-                "--genco",
-                &format!("--offload-arch={arch}"),
-                "-O3",
-                "-ffast-math",
-                "-mno-wavefrontsize64",
-                "-DHIP_ENABLE_WARP_SYNC_BUILTINS",
-                kernel_src.to_str().unwrap(),
-                "-o",
-                hsaco_out.to_str().unwrap(),
-            ])
+        // Build arguments dynamically so we don't hardcode broken absolute paths
+        let mut args = vec![
+            "--genco".to_string(),
+            format!("--offload-arch={arch}"),
+            "-O3".to_string(),
+            "-ffast-math".to_string(),
+            "-mno-wavefrontsize64".to_string(),
+            "-DHIP_ENABLE_WARP_SYNC_BUILTINS".to_string(),
+            // for gpu assembly debuging
+            //"--save-temps".to_string(),
+
+        ];
+
+        // Safely inject the device library path ONLY if the environment variable is present
+        if let Ok(hip_lib) = std::env::var("HIP_LIB_DIR") {
+            args.push(format!("--rocm-device-lib-path={hip_lib}"));
+        }
+
+        args.push(kernel_src.to_str().unwrap().to_string());
+        args.push("-o".to_string());
+        args.push(hsaco_out.to_str().unwrap().to_string());
+
+        let mut cmd = Command::new("hipcc");
+        cmd.args(&args);
+
+        // Pass ROCM_PATH directly to the hipcc process environment
+        if let Ok(rocm_path) = std::env::var("ROCM_PATH") {
+            cmd.env("ROCM_PATH", rocm_path);
+        }
+
+        let output = cmd
             .output()
             .expect("hipcc not found — install ROCm and ensure hipcc is on PATH");
 
@@ -105,13 +123,13 @@ mod hip {
             let rocm_lib64 = format!("{rocm_path}/lib64");
             let rocm_lib = format!("{rocm_path}/lib");
 
-                if Path::new(&rocm_lib64).join("libamdhip64.so").exists() {
-                    println!("cargo:rustc-link-search=native={rocm_lib64}");
-                } else if Path::new(&rocm_lib).join("libamdhip64.so").exists() {
-                    println!("cargo:rustc-link-search=native={rocm_lib}");
-                } else {
-                    println!("cargo:rustc-link-search=native={rocm_lib}");
-                }
+            if Path::new(&rocm_lib64).join("libamdhip64.so").exists() {
+                println!("cargo:rustc-link-search=native={rocm_lib64}");
+            } else if Path::new(&rocm_lib).join("libamdhip64.so").exists() {
+                println!("cargo:rustc-link-search=native={rocm_lib}");
+            } else {
+                println!("cargo:rustc-link-search=native={rocm_lib}");
+            }
         }
 
         println!("cargo:rustc-link-lib=amdhip64");
